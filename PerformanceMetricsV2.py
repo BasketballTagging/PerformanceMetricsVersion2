@@ -1,262 +1,207 @@
-"""
-StFx Mens Basketball Tagger
-Single-file Streamlit app.
-
-How to run:
-  pip install -r requirements.txt
-  streamlit run app.py
-
-requirements.txt should include:
-  streamlit
-  pandas
-  pillow
-
-Features:
-- Required sidebar inputs: Date, Opponent, Quarter, Players, Plays.
-- Add players (name + picture). Player pictures are clickable (image link).
-- Add plays manually in sidebar. When tagging, each play prompts Good Read / Bad Read.
-- Tags stored in session and shown in an ordered table (Date, Opponent, Quarter, Player, Play, Read).
-- CSV export (download button) and local CSV save option.
-"""
-
 import streamlit as st
-from PIL import Image
-import io
-import base64
 import pandas as pd
-from datetime import date
-import os
+from datetime import datetime
+import uuid
+from io import BytesIO
+from PIL import Image
 
 st.set_page_config(page_title="StFx Mens Basketball Tagger", layout="wide")
 
-# ---------- Helper utilities ----------
-def image_file_to_base64(img_file) -> str:
-    img = Image.open(img_file).convert("RGBA")
-    buffered = io.BytesIO()
-    img.save(buffered, format="PNG")
-    img_b64 = base64.b64encode(buffered.getvalue()).decode()
-    return f"data:image/png;base64,{img_b64}"
+# --- Helpers -----------------------------------------------------------------
 
-def ensure_session():
+def init_state():
     if "players" not in st.session_state:
-        # players: list of dicts {id, name, img_b64}
-        st.session_state["players"] = []
+        st.session_state.players = []  # list of dicts: {id,name,image_bytes}
     if "plays" not in st.session_state:
-        st.session_state["plays"] = []
+        st.session_state.plays = []
     if "tags" not in st.session_state:
-        # tags: list of dicts {date, opponent, quarter, player_name, play, read}
-        st.session_state["tags"] = []
-    if "game_started" not in st.session_state:
-        st.session_state["game_started"] = False
-    if "current_tag_player" not in st.session_state:
-        st.session_state["current_tag_player"] = None
+        st.session_state.tags = []  # list of tag dicts
+    if "game_info" not in st.session_state:
+        st.session_state.game_info = {"date": None, "opponent": "", "quarter": "1"}
+    if "selected_player" not in st.session_state:
+        st.session_state.selected_player = None
 
-ensure_session()
 
-# ---------- Sidebar: required pre-game inputs ----------
-st.sidebar.title("Game Setup (Required)")
-game_date = st.sidebar.date_input("Date", value=date.today(), key="game_date")
-opponent = st.sidebar.text_input("Opponent", key="opponent")
-quarter = st.sidebar.selectbox("Quarter", ["1", "2", "3", "4", "OT"], index=0)
+def add_player(name, image_file):
+    image_bytes = None
+    if image_file is not None:
+        image_bytes = image_file.read()
+    player = {"id": str(uuid.uuid4()), "name": name, "image": image_bytes}
+    st.session_state.players.append(player)
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Manage Plays (required)")
-with st.sidebar.form("add_play_form", clear_on_submit=True):
-    new_play = st.text_input("Add a play label (e.g. 'Help Defense', 'Closeout')", key="new_play")
-    add_play_btn = st.form_submit_button("Add Play")
-if add_play_btn and new_play:
-    st.session_state["plays"].append(new_play.strip())
-    st.experimental_rerun()  # refresh so plays appear immediately
 
-# show current plays and remove option
-if st.session_state["plays"]:
-    for i, p in enumerate(st.session_state["plays"]):
-        cols = st.sidebar.columns([0.85, 0.15])
-        cols[0].write(f"- {p}")
-        if cols[1].button("X", key=f"delplay_{i}"):
-            st.session_state["plays"].pop(i)
-            st.experimental_rerun()
+def add_play(play_name):
+    if play_name and play_name.strip() != "":
+        st.session_state.plays.append(play_name.strip())
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Manage Players (required)")
 
-# Add player form
-with st.sidebar.form("add_player_form", clear_on_submit=True):
-    player_name = st.text_input("Player name")
-    player_img = st.file_uploader("Player picture (jpg/png)", type=["png", "jpg", "jpeg"])
-    submitted_player = st.form_submit_button("Add Player")
-if submitted_player:
-    if not player_name:
-        st.sidebar.error("Player name required.")
-    elif not player_img:
-        st.sidebar.error("Player picture required.")
-    else:
-        try:
-            b64 = image_file_to_base64(player_img)
-            new_id = len(st.session_state["players"]) + 1
-            st.session_state["players"].append({"id": new_id, "name": player_name.strip(), "img_b64": b64})
-            st.sidebar.success(f"Added player: {player_name}")
-            st.experimental_rerun()
-        except Exception as e:
-            st.sidebar.error(f"Failed to process image: {e}")
+def create_tag(player_id, play_name, note, timestamp=None):
+    if timestamp is None:
+        timestamp = datetime.utcnow().isoformat()
+    tag = {
+        "tag_id": str(uuid.uuid4()),
+        "player_id": player_id,
+        "player_name": next((p["name"] for p in st.session_state.players if p["id"] == player_id), ""),
+        "play": play_name,
+        "note": note,
+        "timestamp_utc": timestamp,
+    }
+    st.session_state.tags.append(tag)
+    return tag
 
-# show players & allow deletion
-if st.session_state["players"]:
-    st.sidebar.markdown("**Current players**")
-    for i, pl in enumerate(st.session_state["players"]):
-        cols = st.sidebar.columns([0.6, 0.3, 0.1])
-        cols[0].text(pl["name"])
-        # small preview
-        cols[1].image(pl["img_b64"], width=60)
-        if cols[2].button("Del", key=f"del_{i}"):
-            st.session_state["players"].pop(i)
-            st.experimental_rerun()
 
-st.sidebar.markdown("---")
-start_ready = st.sidebar.button("Start Tagging (All fields required)")
+def players_df():
+    rows = []
+    for p in st.session_state.players:
+        rows.append({"id": p["id"], "name": p["name"]})
+    return pd.DataFrame(rows)
 
-# ---------- Validate required fields ----------
-missing = []
-if not opponent:
-    missing.append("Opponent")
-if not st.session_state["plays"]:
-    missing.append("Plays")
-if not st.session_state["players"]:
-    missing.append("Players")
-if missing:
-    st.warning(f"Before starting tagging, add: {', '.join(missing)}")
-if start_ready:
-    if missing:
-        st.sidebar.error("Cannot start: required fields missing.")
-    else:
-        st.session_state["game_started"] = True
-        st.sidebar.success("Tagging started! Use the player images to tag plays.")
-        # ensure query params cleared
-        st.experimental_set_query_params()
-        st.experimental_rerun()
 
-# ---------- Main area ----------
-st.title("StFx Mens Basketball Tagger")
-st.markdown("Use the player images (below) to tag plays. Plays will ask for 'Good Read' or 'Bad Read'.")
-st.markdown("---")
+def tags_df():
+    if not st.session_state.tags:
+        return pd.DataFrame(columns=["tag_id", "player_id", "player_name", "play", "note", "timestamp_utc"]) 
+    return pd.DataFrame(st.session_state.tags)
 
-if not st.session_state["game_started"]:
-    st.info("Complete the setup in the sidebar and press **Start Tagging**.")
-    # still show small preview of players
-    if st.session_state["players"]:
-        st.subheader("Players (preview)")
-        cols = st.columns(4)
-        for idx, pl in enumerate(st.session_state["players"]):
-            col = cols[idx % 4]
-            col.image(pl["img_b64"], use_column_width="always")
-            col.caption(pl["name"])
-    st.stop()
 
-# ---------- clickable player images (image link approach) ----------
-st.subheader("Tap a Player to Tag a Play")
-# Build clickable images as anchors with query params. Clicking reloads the app in the same tab with ?player=<id>
-player_cols = st.columns(4)
-for idx, pl in enumerate(st.session_state["players"]):
-    c = player_cols[idx % 4]
-    # inline HTML anchor with image
-    player_anchor_html = f"""
-    <a href='?player={pl["id"]}' style='text-decoration:none;'>
-      <div style='text-align:center; padding:6px;'>
-        <img src="{pl["img_b64"]}" style='width:140px; height:140px; object-fit:cover; border-radius:12px; display:block; margin-left:auto;margin-right:auto;'>
-        <div style='margin-top:6px; font-weight:600; text-align:center; color:var(--secondary-text-color);'>{pl["name"]}</div>
-      </div>
-    </a>
-    """
-    c.markdown(player_anchor_html, unsafe_allow_html=True)
+# --- Init --------------------------------------------------------------------
+init_state()
 
-# Check query params for player click
-query = st.experimental_get_query_params()
-if "player" in query:
-    try:
-        player_id = int(query["player"][0])
-    except:
-        player_id = None
-    # find player
-    selected_player = next((p for p in st.session_state["players"] if p["id"] == player_id), None)
-    # clear params (so re-clicking same image will work later)
-    st.experimental_set_query_params()
-    if selected_player:
-        st.session_state["current_tag_player"] = selected_player
-    else:
-        st.error("Selected player not found.")
+# --- Sidebar: game setup -----------------------------------------------------
+with st.sidebar:
+    st.header("Game Setup (Required)")
+    date = st.date_input("Game date", value=datetime.now().date())
+    opponent = st.text_input("Opponent")
+    quarter = st.selectbox("Quarter", ["1", "2", "3", "4", "OT"], index=0)
 
-# ---------- Tagging UI (when player selected) ----------
-if st.session_state["current_tag_player"]:
-    sp = st.session_state["current_tag_player"]
+    st.session_state.game_info["date"] = date.isoformat()
+    st.session_state.game_info["opponent"] = opponent
+    st.session_state.game_info["quarter"] = quarter
+
     st.markdown("---")
-    st.subheader(f"Tagging: {sp['name']}")
-    cols = st.columns([0.3, 0.7])
-    cols[0].image(sp["img_b64"], width=180)
-    with cols[1]:
-        # Play selection
-        play_choice = st.selectbox("Select Play", options=st.session_state["plays"])
-        read_choice = st.radio("Read", options=["Good Read", "Bad Read"])
-        notes = st.text_area("Notes (optional)", max_chars=200)
-        submit_tag = st.button("Submit Tag", key=f"submit_tag_{sp['id']}")
-        cancel_tag = st.button("Cancel", key=f"cancel_tag_{sp['id']}")
+    st.subheader("Manage Players")
+    with st.form("add_player_form", clear_on_submit=True):
+        pname = st.text_input("Player name", key="pname_input")
+        pimg = st.file_uploader("Upload player picture (png/jpg)", type=["png", "jpg", "jpeg"], key="pimg_upload")
+        submitted = st.form_submit_button("Add Player")
+        if submitted:
+            if not pname:
+                st.warning("Please enter a player name before adding.")
+            else:
+                add_player(pname, pimg)
+                st.success(f"Added player: {pname}")
 
-    if cancel_tag:
-        st.session_state["current_tag_player"] = None
-        st.success("Tagging cancelled.")
-        st.experimental_rerun()
+    st.markdown("---")
+    st.subheader("Manage Plays")
+    with st.form("add_play_form", clear_on_submit=True):
+        play_name = st.text_input("Play name", key="play_input")
+        add_play_sub = st.form_submit_button("Add Play")
+        if add_play_sub:
+            if not play_name:
+                st.warning("Please enter a play name")
+            else:
+                add_play(play_name)
+                st.success(f"Play added: {play_name}")
 
-    if submit_tag:
-        # build tag record
-        tag = {
-            "Date": st.session_state.get("game_date", date.today()).isoformat(),
-            "Opponent": opponent,
-            "Quarter": quarter,
-            "Player": sp["name"],
-            "Play": play_choice,
-            "Read": read_choice,
-            "Notes": notes,
-            "RecordedAt": pd.Timestamp.now().isoformat()
-        }
-        st.session_state["tags"].append(tag)
-        st.success(f"Tagged {sp['name']} — {play_choice} / {read_choice}")
-        # clear current tag player to return to player grid
-        st.session_state["current_tag_player"] = None
-        st.experimental_rerun()
+    if st.session_state.plays:
+        st.write("Current plays:")
+        for p in st.session_state.plays:
+            st.write(f"- {p}")
 
-# ---------- Tags table & export ----------
+    st.markdown("---")
+    st.subheader("Export / Save")
+    if st.button("Download tags as CSV"):
+        df = tags_df()
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Click to download CSV", data=csv, file_name="tags.csv", mime="text/csv")
+
+    if st.button("Download tags as JSON"):
+        df = tags_df()
+        json_bytes = df.to_json(orient="records").encode("utf-8")
+        st.download_button("Click to download JSON", data=json_bytes, file_name="tags.json", mime="application/json")
+
+
+# --- Main layout -------------------------------------------------------------
+st.title("StFx Mens Basketball Tagger")
+st.write("Fill the game setup in the sidebar before tagging. Add players and plays there.")
+
+cols = st.columns([2, 3])
+left = cols[0]
+right = cols[1]
+
+# Left column: players gallery with clickable interface ---------------------------------
+with left:
+    st.subheader("Players")
+    if not st.session_state.players:
+        st.info("No players yet. Add players in the sidebar.")
+    else:
+        # display players in grid
+        per_row = 3
+        players = st.session_state.players
+        for i in range(0, len(players), per_row):
+            row = players[i : i + per_row]
+            cols_row = st.columns(per_row)
+            for col, player in zip(cols_row, row):
+                with col:
+                    # show image if present, else placeholder
+                    if player["image"]:
+                        img = Image.open(BytesIO(player["image"]))
+                        st.image(img, use_column_width=True, caption=player["name"])
+                    else:
+                        st.write("[No image]")
+                    # Clicking the image: currently implemented as button beneath the image
+                    if st.button(f"Tag {player['name']}", key=f"btn_{player['id']}"):
+                        st.session_state.selected_player = player["id"]
+
+# Right column: tagging panel -------------------------------------------------
+with right:
+    st.subheader("Tagging Panel")
+    if st.session_state.selected_player is None:
+        st.info("Select a player (click the button under their picture) to start tagging.")
+    else:
+        pid = st.session_state.selected_player
+        pname = next((p["name"] for p in st.session_state.players if p["id"] == pid), "(unknown)")
+        st.markdown(f"**Selected player:** {pname}")
+        with st.form("tag_form"):
+            play = st.selectbox("Select play", options=st.session_state.plays if st.session_state.plays else ["No plays defined"])
+            note = st.text_area("Note (optional)")
+            custom_time = st.time_input("Tag time (UTC)", value=datetime.utcnow().time())
+            tag_submit = st.form_submit_button("Save Tag")
+            if tag_submit:
+                if not st.session_state.plays:
+                    st.warning("No plays defined. Add plays in the sidebar before tagging.")
+                else:
+                    # assemble ISO timestamp from date (game date) + custom_time
+                    iso_ts = datetime.combine(datetime.fromisoformat(st.session_state.game_info["date"]).date(), custom_time).isoformat()
+                    created = create_tag(pid, play, note, timestamp=iso_ts)
+                    st.success(f"Tag saved: {created['play']} for {created['player_name']} at {created['timestamp_utc']}")
+
+    st.markdown("---")
+    st.subheader("Recent Tags")
+    df_tags = tags_df()
+    if df_tags.empty:
+        st.write("No tags yet.")
+    else:
+        st.dataframe(df_tags.sort_values(by="timestamp_utc", ascending=False))
+
+# --- Footer: quick actions --------------------------------------------------
 st.markdown("---")
-st.subheader("Tagged Events (in order)")
-if st.session_state["tags"]:
-    df = pd.DataFrame(st.session_state["tags"])
-    # show only required columns in requested order (Date, Opponent, Quarter, Player, Play, Read)
-    display_df = df[["Date", "Opponent", "Quarter", "Player", "Play", "Read", "Notes", "RecordedAt"]]
-    st.dataframe(display_df, use_container_width=True)
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("Clear selected player"):
+        st.session_state.selected_player = None
+with col2:
+    if st.button("Clear tags (all)"):
+        st.session_state.tags = []
+        st.success("All tags cleared")
+with col3:
+    if st.button("Reset app (clears players, plays, tags)"):
+        st.session_state.players = []
+        st.session_state.plays = []
+        st.session_state.tags = []
+        st.success("App reset")
 
-    # Download as CSV
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button("Download CSV", data=csv_bytes, file_name=f"stfx_tags_{st.session_state['game_date']}.csv", mime="text/csv")
+# --- Notes for developer (displayed in app) ---------------------------------
+st.sidebar.markdown("---")
+st.sidebar.caption("Built for quick tagging. For true image-as-button behavior (image itself clickable), a Streamlit Component is required — I can add that on request.")
 
-    # Save to local CSV file option (server/local)
-    if st.button("Save to local CSV (server)"):
-        out_dir = "tag_outputs"
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"stfx_tags_{st.session_state['game_date']}.csv")
-        df.to_csv(out_path, index=False)
-        st.success(f"Saved to {out_path}")
-
-    # Option to clear tags
-    if st.button("Clear all tags (danger)"):
-        st.session_state["tags"] = []
-        st.experimental_rerun()
-else:
-    st.info("No tags recorded yet. Tap a player image above to tag a play.")
-
-# ---------- Small help / usage ----------
-st.markdown("---")
-st.info("""
-**Usage tips**
-- Add players and plays in the **sidebar** before starting.
-- Click **Start Tagging** to enable tagging.
-- Tap a player's picture to open the tagging form (image click uses a query param and reloads the page in the same tab).
-- Tags are appended in order and can be downloaded as CSV for external analytics.
-""")
+# --- End --------------------------------------------------------------------
