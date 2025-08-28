@@ -180,3 +180,4 @@ else:
 # Footer instructions
 st.markdown("---")
 st.caption("Built for quick practice tagging — let me know if you want: auto-timestamp sync with video, extra tag types, or per-player dashboards.")
+
