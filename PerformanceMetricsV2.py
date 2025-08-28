@@ -1,295 +1,262 @@
+"""
+StFx Mens Basketball Tagger
+Single-file Streamlit app.
+
+How to run:
+  pip install -r requirements.txt
+  streamlit run app.py
+
+requirements.txt should include:
+  streamlit
+  pandas
+  pillow
+
+Features:
+- Required sidebar inputs: Date, Opponent, Quarter, Players, Plays.
+- Add players (name + picture). Player pictures are clickable (image link).
+- Add plays manually in sidebar. When tagging, each play prompts Good Read / Bad Read.
+- Tags stored in session and shown in an ordered table (Date, Opponent, Quarter, Player, Play, Read).
+- CSV export (download button) and local CSV save option.
+"""
+
 import streamlit as st
+from PIL import Image
+import io
+import base64
 import pandas as pd
-from datetime import datetime, date
-import re
+from datetime import date
+import os
 
 st.set_page_config(page_title="StFx Mens Basketball Tagger", layout="wide")
 
-# ---------------------------
-# Session State & Utilities
-# ---------------------------
-def init_state():
-    st.session_state.setdefault("plays", [])               
-    st.session_state.setdefault("log", [])                 
-    st.session_state.setdefault("selected_play", None)     
-    st.session_state.setdefault("selected_player", None)   # NEW
-    st.session_state.setdefault("opponent", "")
-    st.session_state.setdefault("game_date", date.today())
-    st.session_state.setdefault("quarter", "")
-    st.session_state.setdefault("new_play", "")
-    st.session_state.setdefault("players", [])             # NEW
-    st.session_state.setdefault("new_player_name", "")
-    st.session_state.setdefault("new_player_image", None)
+# ---------- Helper utilities ----------
+def image_file_to_base64(img_file) -> str:
+    img = Image.open(img_file).convert("RGBA")
+    buffered = io.BytesIO()
+    img.save(buffered, format="PNG")
+    img_b64 = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_b64}"
 
-def safe_filename(s: str) -> str:
-    s = s.strip().replace(" ", "_")
-    s = re.sub(r"[^A-Za-z0-9_\-\.]", "", s)
-    return s
+def ensure_session():
+    if "players" not in st.session_state:
+        # players: list of dicts {id, name, img_b64}
+        st.session_state["players"] = []
+    if "plays" not in st.session_state:
+        st.session_state["plays"] = []
+    if "tags" not in st.session_state:
+        # tags: list of dicts {date, opponent, quarter, player_name, play, read}
+        st.session_state["tags"] = []
+    if "game_started" not in st.session_state:
+        st.session_state["game_started"] = False
+    if "current_tag_player" not in st.session_state:
+        st.session_state["current_tag_player"] = None
 
-def points_from_result(result: str) -> int:
-    return {"Made 2": 2, "Made 3": 3, "Missed 2": 0, "Missed 3": 0, "Foul": 0}.get(result, 0)
+ensure_session()
 
-def add_log(play: str, result: str):
-    st.session_state["log"].append({
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "opponent": st.session_state["opponent"],
-        "game_date": str(st.session_state["game_date"]),
-        "quarter": st.session_state["quarter"],
-        "player": st.session_state["selected_player"],   # NEW
-        "play": play,
-        "result": result,
-        "points": points_from_result(result),
-    })
-
-def compute_metrics(log_df: pd.DataFrame) -> pd.DataFrame:
-    if log_df.empty:
-        return pd.DataFrame(columns=["Play", "Attempts", "Points", "PPP", "Frequency", "Success Rate"])
-
-    attempts = log_df.groupby("play").size().rename("Attempts")
-    points = log_df.groupby("play")["points"].sum().rename("Points")
-
-    metrics = pd.concat([attempts, points], axis=1).reset_index().rename(columns={"play": "Play"})
-    metrics["PPP"] = metrics["Points"] / metrics["Attempts"]
-
-    total_attempts = metrics["Attempts"].sum()
-    metrics["Frequency"] = metrics["Attempts"] / (total_attempts if total_attempts else 1)
-
-    made_mask = log_df["result"].isin(["Made 2", "Made 3"])
-    att_mask = log_df["result"].isin(["Made 2", "Made 3", "Missed 2", "Missed 3"])
-    made_counts = log_df[made_mask].groupby("play").size()
-    shot_attempts = log_df[att_mask].groupby("play").size()
-
-    def success_rate(play_name):
-        made = int(made_counts.get(play_name, 0))
-        atts = int(shot_attempts.get(play_name, 0))
-        return (made / atts) if atts else 0.0
-
-    metrics["Success Rate"] = metrics["Play"].map(success_rate)
-    metrics = metrics.sort_values(by=["PPP", "Attempts"], ascending=[False, False]).reset_index(drop=True)
-    return metrics
-
-init_state()
-
-# ---------------------------
-# Sidebar: Game Setup & Playbook & Players
-# ---------------------------
-st.sidebar.header("Game Setup")
-st.session_state["opponent"] = st.sidebar.text_input("Opponent", value=st.session_state["opponent"])
-st.session_state["game_date"] = st.sidebar.date_input("Game Date", value=st.session_state["game_date"])
-st.session_state["quarter"] = st.sidebar.selectbox(
-    "Quarter", ["", "1", "2", "3", "4", "OT"],
-    index=["", "1", "2", "3", "4", "OT"].index(st.session_state["quarter"])
-    if st.session_state["quarter"] in ["", "1", "2", "3", "4", "OT"] else 0
-)
-ready_to_tag = bool(st.session_state["opponent"] and st.session_state["game_date"] and st.session_state["quarter"])
+# ---------- Sidebar: required pre-game inputs ----------
+st.sidebar.title("Game Setup (Required)")
+game_date = st.sidebar.date_input("Date", value=date.today(), key="game_date")
+opponent = st.sidebar.text_input("Opponent", key="opponent")
+quarter = st.sidebar.selectbox("Quarter", ["1", "2", "3", "4", "OT"], index=0)
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Playbook")
+st.sidebar.subheader("Manage Plays (required)")
+with st.sidebar.form("add_play_form", clear_on_submit=True):
+    new_play = st.text_input("Add a play label (e.g. 'Help Defense', 'Closeout')", key="new_play")
+    add_play_btn = st.form_submit_button("Add Play")
+if add_play_btn and new_play:
+    st.session_state["plays"].append(new_play.strip())
+    st.experimental_rerun()  # refresh so plays appear immediately
 
-st.session_state["new_play"] = st.sidebar.text_input("New Play Name", value=st.session_state["new_play"])
-
-def add_play():
-    raw = st.session_state["new_play"].strip()
-    if not raw:
-        return
-    existing_lower = {p.lower() for p in st.session_state["plays"]}
-    if raw.lower() in existing_lower:
-        st.sidebar.warning("Play already exists.")
-        return
-    st.session_state["plays"].append(raw)
-    st.session_state["new_play"] = ""
-
-if st.sidebar.button("ADD NEW PLAY", use_container_width=True):
-    add_play()
-
+# show current plays and remove option
 if st.session_state["plays"]:
-    st.sidebar.caption("Current plays:")
-    for p in st.session_state["plays"]:
-        st.sidebar.write(f"• {p}")
+    for i, p in enumerate(st.session_state["plays"]):
+        cols = st.sidebar.columns([0.85, 0.15])
+        cols[0].write(f"- {p}")
+        if cols[1].button("X", key=f"delplay_{i}"):
+            st.session_state["plays"].pop(i)
+            st.experimental_rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Players")
+st.sidebar.subheader("Manage Players (required)")
 
-st.session_state["new_player_name"] = st.sidebar.text_input("Player Name", value=st.session_state["new_player_name"])
-st.session_state["new_player_image"] = st.sidebar.file_uploader(
-    "Upload Player Picture", type=["png", "jpg", "jpeg"], key="player_image"
-)
-
-def add_player():
-    if not st.session_state["new_player_name"] or not st.session_state["new_player_image"]:
-        st.sidebar.warning("Please provide both name and picture.")
-        return
-    new_player = {
-        "name": st.session_state["new_player_name"].strip(),
-        "image_bytes": st.session_state["new_player_image"].read()
-    }
-    st.session_state["players"].append(new_player)
-    st.session_state["new_player_name"] = ""
-    st.session_state["new_player_image"] = None
-
-if st.sidebar.button("ADD NEW PLAYER", use_container_width=True):
-    add_player()
-
-if st.session_state["players"]:
-    st.sidebar.caption("Current players:")
-    for p in st.session_state["players"]:
-        st.sidebar.write(f"• {p['name']}")
-
-st.sidebar.markdown("---")
-if st.sidebar.button("Reset Game (clears log & selections)", type="secondary"):
-    st.session_state["log"] = []
-    st.session_state["selected_play"] = None
-    st.session_state["selected_player"] = None
-    st.success("Game state cleared.")
-
-# ---------------------------
-# Main: Tagging & Metrics
-# ---------------------------
-st.title("StFx Mens Basketball Tagger")
-
-if not ready_to_tag:
-    st.warning("Select Opponent, Game Date, and Quarter in the sidebar to begin tagging.")
-    st.stop()
-else:
-    st.write(
-        f"**Game:** vs **{st.session_state['opponent']}** | "
-        f"**Date:** {st.session_state['game_date']} | "
-        f"**Quarter:** {st.session_state['quarter']}"
-    )
-
-# Player selection grid
-st.subheader("Select a Player")
-if not st.session_state["players"]:
-    st.info("Add at least one player in the sidebar.")
-else:
-    cols_per_row = 4
-    rows = (len(st.session_state["players"]) + cols_per_row - 1) // cols_per_row
-    idx = 0
-    for r in range(rows):
-        row_cols = st.columns(cols_per_row)
-        for c in range(cols_per_row):
-            if idx >= len(st.session_state["players"]):
-                break
-            player = st.session_state["players"][idx]
-            with row_cols[c]:
-                if st.button(player["name"], key=f"player_btn_{idx}", use_container_width=True):
-                    st.session_state["selected_player"] = player["name"]
-                st.image(player["image_bytes"], caption=player["name"], use_container_width=True)
-            idx += 1
-
-# Play selection grid
-if st.session_state["selected_player"]:
-    st.subheader(f"Select a Play for {st.session_state['selected_player']}")
-    if not st.session_state["plays"]:
-        st.info("Add at least one play in the sidebar to start tagging.")
+# Add player form
+with st.sidebar.form("add_player_form", clear_on_submit=True):
+    player_name = st.text_input("Player name")
+    player_img = st.file_uploader("Player picture (jpg/png)", type=["png", "jpg", "jpeg"])
+    submitted_player = st.form_submit_button("Add Player")
+if submitted_player:
+    if not player_name:
+        st.sidebar.error("Player name required.")
+    elif not player_img:
+        st.sidebar.error("Player picture required.")
     else:
-        cols_per_row = 4
-        rows = (len(st.session_state["plays"]) + cols_per_row - 1) // cols_per_row
-        idx = 0
-        for r in range(rows):
-            row_cols = st.columns(cols_per_row)
-            for c in range(cols_per_row):
-                if idx >= len(st.session_state["plays"]):
-                    break
-                play = st.session_state["plays"][idx]
-                if row_cols[c].button(play, key=f"play_btn_{idx}", use_container_width=True):
-                    st.session_state["selected_play"] = play
-                idx += 1
+        try:
+            b64 = image_file_to_base64(player_img)
+            new_id = len(st.session_state["players"]) + 1
+            st.session_state["players"].append({"id": new_id, "name": player_name.strip(), "img_b64": b64})
+            st.sidebar.success(f"Added player: {player_name}")
+            st.experimental_rerun()
+        except Exception as e:
+            st.sidebar.error(f"Failed to process image: {e}")
 
-# Tagging actions
-if st.session_state["selected_player"] and st.session_state["selected_play"]:
-    st.markdown(
-        f"**Tagging:** Player: `{st.session_state['selected_player']}` | "
-        f"Play: `{st.session_state['selected_play']}`"
-    )
-    a, b, c, d, e, f = st.columns(6)
-    if a.button("Made 2", key="act_m2", use_container_width=True):
-        add_log(st.session_state["selected_play"], "Made 2")
-    if b.button("Made 3", key="act_m3", use_container_width=True):
-        add_log(st.session_state["selected_play"], "Made 3")
-    if c.button("Missed 2", key="act_x2", use_container_width=True):
-        add_log(st.session_state["selected_play"], "Missed 2")
-    if d.button("Missed 3", key="act_x3", use_container_width=True):
-        add_log(st.session_state["selected_play"], "Missed 3")
-    if e.button("Foul", key="act_fl", use_container_width=True):
-        add_log(st.session_state["selected_play"], "Foul")
-    if f.button("Undo Last", key="undo_last", use_container_width=True):
-        if st.session_state["log"]:
-            st.session_state["log"].pop()
-            st.toast("Last tag removed.")
-        else:
-            st.toast("No tags to undo.", icon="⚠️")
+# show players & allow deletion
+if st.session_state["players"]:
+    st.sidebar.markdown("**Current players**")
+    for i, pl in enumerate(st.session_state["players"]):
+        cols = st.sidebar.columns([0.6, 0.3, 0.1])
+        cols[0].text(pl["name"])
+        # small preview
+        cols[1].image(pl["img_b64"], width=60)
+        if cols[2].button("Del", key=f"del_{i}"):
+            st.session_state["players"].pop(i)
+            st.experimental_rerun()
 
+st.sidebar.markdown("---")
+start_ready = st.sidebar.button("Start Tagging (All fields required)")
+
+# ---------- Validate required fields ----------
+missing = []
+if not opponent:
+    missing.append("Opponent")
+if not st.session_state["plays"]:
+    missing.append("Plays")
+if not st.session_state["players"]:
+    missing.append("Players")
+if missing:
+    st.warning(f"Before starting tagging, add: {', '.join(missing)}")
+if start_ready:
+    if missing:
+        st.sidebar.error("Cannot start: required fields missing.")
+    else:
+        st.session_state["game_started"] = True
+        st.sidebar.success("Tagging started! Use the player images to tag plays.")
+        # ensure query params cleared
+        st.experimental_set_query_params()
+        st.experimental_rerun()
+
+# ---------- Main area ----------
+st.title("StFx Mens Basketball Tagger")
+st.markdown("Use the player images (below) to tag plays. Plays will ask for 'Good Read' or 'Bad Read'.")
 st.markdown("---")
 
-# Build DataFrames
-log_df = pd.DataFrame(st.session_state["log"])
-metrics_df = compute_metrics(log_df) if not log_df.empty else pd.DataFrame(
-    columns=["Play", "Attempts", "Points", "PPP", "Frequency", "Success Rate"]
-)
+if not st.session_state["game_started"]:
+    st.info("Complete the setup in the sidebar and press **Start Tagging**.")
+    # still show small preview of players
+    if st.session_state["players"]:
+        st.subheader("Players (preview)")
+        cols = st.columns(4)
+        for idx, pl in enumerate(st.session_state["players"]):
+            col = cols[idx % 4]
+            col.image(pl["img_b64"], use_column_width="always")
+            col.caption(pl["name"])
+    st.stop()
 
-# Metrics table
-st.subheader("📊 Per Play Metrics")
-if metrics_df.empty:
-    st.info("No data yet — tag some plays to see metrics.")
+# ---------- clickable player images (image link approach) ----------
+st.subheader("Tap a Player to Tag a Play")
+# Build clickable images as anchors with query params. Clicking reloads the app in the same tab with ?player=<id>
+player_cols = st.columns(4)
+for idx, pl in enumerate(st.session_state["players"]):
+    c = player_cols[idx % 4]
+    # inline HTML anchor with image
+    player_anchor_html = f"""
+    <a href='?player={pl["id"]}' style='text-decoration:none;'>
+      <div style='text-align:center; padding:6px;'>
+        <img src="{pl["img_b64"]}" style='width:140px; height:140px; object-fit:cover; border-radius:12px; display:block; margin-left:auto;margin-right:auto;'>
+        <div style='margin-top:6px; font-weight:600; text-align:center; color:var(--secondary-text-color);'>{pl["name"]}</div>
+      </div>
+    </a>
+    """
+    c.markdown(player_anchor_html, unsafe_allow_html=True)
+
+# Check query params for player click
+query = st.experimental_get_query_params()
+if "player" in query:
+    try:
+        player_id = int(query["player"][0])
+    except:
+        player_id = None
+    # find player
+    selected_player = next((p for p in st.session_state["players"] if p["id"] == player_id), None)
+    # clear params (so re-clicking same image will work later)
+    st.experimental_set_query_params()
+    if selected_player:
+        st.session_state["current_tag_player"] = selected_player
+    else:
+        st.error("Selected player not found.")
+
+# ---------- Tagging UI (when player selected) ----------
+if st.session_state["current_tag_player"]:
+    sp = st.session_state["current_tag_player"]
+    st.markdown("---")
+    st.subheader(f"Tagging: {sp['name']}")
+    cols = st.columns([0.3, 0.7])
+    cols[0].image(sp["img_b64"], width=180)
+    with cols[1]:
+        # Play selection
+        play_choice = st.selectbox("Select Play", options=st.session_state["plays"])
+        read_choice = st.radio("Read", options=["Good Read", "Bad Read"])
+        notes = st.text_area("Notes (optional)", max_chars=200)
+        submit_tag = st.button("Submit Tag", key=f"submit_tag_{sp['id']}")
+        cancel_tag = st.button("Cancel", key=f"cancel_tag_{sp['id']}")
+
+    if cancel_tag:
+        st.session_state["current_tag_player"] = None
+        st.success("Tagging cancelled.")
+        st.experimental_rerun()
+
+    if submit_tag:
+        # build tag record
+        tag = {
+            "Date": st.session_state.get("game_date", date.today()).isoformat(),
+            "Opponent": opponent,
+            "Quarter": quarter,
+            "Player": sp["name"],
+            "Play": play_choice,
+            "Read": read_choice,
+            "Notes": notes,
+            "RecordedAt": pd.Timestamp.now().isoformat()
+        }
+        st.session_state["tags"].append(tag)
+        st.success(f"Tagged {sp['name']} — {play_choice} / {read_choice}")
+        # clear current tag player to return to player grid
+        st.session_state["current_tag_player"] = None
+        st.experimental_rerun()
+
+# ---------- Tags table & export ----------
+st.markdown("---")
+st.subheader("Tagged Events (in order)")
+if st.session_state["tags"]:
+    df = pd.DataFrame(st.session_state["tags"])
+    # show only required columns in requested order (Date, Opponent, Quarter, Player, Play, Read)
+    display_df = df[["Date", "Opponent", "Quarter", "Player", "Play", "Read", "Notes", "RecordedAt"]]
+    st.dataframe(display_df, use_container_width=True)
+
+    # Download as CSV
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV", data=csv_bytes, file_name=f"stfx_tags_{st.session_state['game_date']}.csv", mime="text/csv")
+
+    # Save to local CSV file option (server/local)
+    if st.button("Save to local CSV (server)"):
+        out_dir = "tag_outputs"
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"stfx_tags_{st.session_state['game_date']}.csv")
+        df.to_csv(out_path, index=False)
+        st.success(f"Saved to {out_path}")
+
+    # Option to clear tags
+    if st.button("Clear all tags (danger)"):
+        st.session_state["tags"] = []
+        st.experimental_rerun()
 else:
-    st.dataframe(
-        metrics_df.style.format({
-            "PPP": "{:.2f}",
-            "Frequency": "{:.1%}",
-            "Success Rate": "{:.1%}"
-        }),
-        use_container_width=True,
-        hide_index=True
-    )
+    st.info("No tags recorded yet. Tap a player image above to tag a play.")
 
-    left, right = st.columns(2)
-    with left:
-        st.caption("PPP by Play")
-        st.bar_chart(metrics_df.set_index("Play")["PPP"], use_container_width=True)
-    with right:
-        st.caption("Frequency by Play")
-        st.bar_chart(metrics_df.set_index("Play")["Frequency"], use_container_width=True)
-
-# Play-by-play table
-st.subheader("🧾 Play-by-Play Log")
-if log_df.empty:
-    st.info("No events logged yet.")
-else:
-    st.dataframe(log_df, use_container_width=True, hide_index=True)
-
-# Exports
-st.subheader("📥 Export")
-if st.button("Prepare Exports"):
-    st.session_state["__exports_ready"] = True
-
-if st.session_state.get("__exports_ready") and not log_df.empty:
-    opp = safe_filename(str(st.session_state["opponent"]))
-    gdt = safe_filename(str(st.session_state["game_date"]))
-    qtr = safe_filename(str(st.session_state["quarter"]))
-
-    metrics_csv = metrics_df.to_csv(index=False).encode("utf-8")
-    log_csv = log_df.to_csv(index=False).encode("utf-8")
-    json_blob = log_df.to_json(orient="records", indent=2).encode("utf-8")
-
-    st.download_button(
-        "Download Per-Play Metrics (CSV)",
-        data=metrics_csv,
-        file_name=f"{opp}_{gdt}_Q{qtr}_metrics.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-    st.download_button(
-        "Download Play-by-Play (CSV)",
-        data=log_csv,
-        file_name=f"{opp}_{gdt}_Q{qtr}_playbyplay.csv",
-        mime="text/csv",
-        use_container_width=True
-    )
-    st.download_button(
-        "Download Snapshot (JSON)",
-        data=json_blob,
-        file_name=f"{opp}_{gdt}_Q{qtr}_snapshot.json",
-        mime="application/json",
-        use_container_width=True
-    )
+# ---------- Small help / usage ----------
+st.markdown("---")
+st.info("""
+**Usage tips**
+- Add players and plays in the **sidebar** before starting.
+- Click **Start Tagging** to enable tagging.
+- Tap a player's picture to open the tagging form (image click uses a query param and reloads the page in the same tab).
+- Tags are appended in order and can be downloaded as CSV for external analytics.
+""")
