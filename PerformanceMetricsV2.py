@@ -24,7 +24,7 @@ def safe_filename(s: str) -> str:
     return s
 
 def points_from_result(result: str) -> int:
-    return {"Good Read": 1, "Missed Read": 0}.get(result, 0)
+    return {"Made 2": 2, "Made 3": 3, "Missed 2": 0, "Missed 3": 0, "Foul": 0}.get(result, 0)
 
 def add_log(play: str, result: str):
     st.session_state["log"].append({
